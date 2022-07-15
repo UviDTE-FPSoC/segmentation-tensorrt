@@ -18,6 +18,10 @@
 #include <time.h>
 #include <stdio.h>
 
+
+#include "EntropyCalibrator.h"
+#include "BatchStream.h"
+
 // utilities ----------------------------------------------------------------------------------------------------------
 //reset cumulative buffers for mean, max, min and variance
 void reset_cumulative(unsigned long long int * total,
@@ -46,7 +50,6 @@ void update_cumulative(unsigned long long int * total,
   if (tmp < *min) *min = tmp;
   if (tmp > *max) *max = tmp;
 
-//  printf("total %lld, begin %lld, end %lld\n", *total, ns_begin, ns_end);
 }
 
 //calculate the variance from the cumulative
@@ -61,16 +64,9 @@ unsigned long long variance (unsigned long long variance ,
   quef2=(total/(float)(rep_tests-1));
   cuadrado_media = quef1 * quef2;
   vari = media_cuadrados - cuadrado_media;
-/*
-  printf("media_cuadrados %f,",media_cuadrados );
-  printf("quef1 %f,",quef1 );
-  printf("quef2 %f,",quef2 );
-  printf("cuadrado_media %f,",cuadrado_media );
-  printf("variance %f\n",vari );
-*/
+
   return (unsigned long long) vari;
 
-  //return ((variance/(rep_tests-1))-(total/rep_tests)*(total/(rep_tests-1)));
 }
 
 // class to log errors, warnings, and other information during the build and inference phases
@@ -112,6 +108,138 @@ size_t getSizeByDim(const nvinfer1::Dims& dims)
     return size;
 }
 
+// feed INT8 calibrator ------------------------------------------------------------------------------------------------
+class CustomBatchStream : public IBatchStream
+{
+public:
+    CustomBatchStream(int batchSize, int maxBatches, const std::string& dataFile)
+        : mBatchSize{batchSize}
+        , mMaxBatches{maxBatches}
+        , mDims{1,3,128,800} // dimensions of the pre-processed images.
+    {
+        readDataFile(dataFile);
+    }
+
+    void reset(int firstBatch) override
+    {
+        mBatchCount = firstBatch;
+    }
+
+    bool next() override
+    {
+        if (mBatchCount >= mMaxBatches)
+        {
+            return false;
+        }
+        ++mBatchCount;
+        return true;
+    }
+
+    void skip(int skipCount) override
+    {
+        mBatchCount += skipCount;
+    }
+
+    float* getBatch() override
+    {
+        return mData.data() + (mBatchCount * mBatchSize * samplesCommon::volume(mDims));
+    }
+
+    float* getLabels() override
+    {
+        return mLabels.data() + (mBatchCount * mBatchSize);
+    }
+
+    int getBatchesRead() const override
+    {
+        return mBatchCount;
+    }
+
+    int getBatchSize() const override
+    {
+        return mBatchSize;
+    }
+
+    nvinfer1::Dims getDims() const override
+    {
+        return Dims{4, {mBatchSize, mDims.d[0], mDims.d[1], mDims.d[2]}, {}};
+    }
+
+private:
+    // this function reads and processes the data to feed the calibrator
+    void readDataFile(const std::string& dataFilePath)
+    {
+        // open calibration names file
+        std::ifstream file{dataFilePath, std::ios::in};
+
+        // pre-processed image dimensions
+        auto input_width = 800;
+        auto input_height = 128;
+        auto channels = 3;
+        auto input_size = cv::Size(input_width, input_height);
+        // BGR to RGB
+        int from_to[] = {0,2,1,1,2,0};
+        std::vector<std::string> csv_row;
+        std::string line, word;
+
+        for (size_t nb = 0; nb < mMaxBatches; ++nb)
+        {
+          for (size_t b = 0; b < mBatchSize; ++b)
+          {
+            // read input image from csv
+            getline(file,line);
+            csv_row.clear();
+            std::stringstream str(line);
+            while(getline(str, word, ','))
+            {
+              csv_row.push_back(word);
+            }
+            
+            // path to dataset
+            std::string image_path = "/media/SD/train_images/" + csv_row[0];
+            // read image and transform to RGB
+            cv::Mat frame_bgr = cv::imread(image_path);
+
+            if (frame_bgr.empty())
+            {
+              std::cerr << "Input image " << image_path << " load failed\n";
+            }
+            
+            cv::Mat frame_rgb(frame_bgr.size(),frame_bgr.type());
+            cv::mixChannels(&frame_bgr,1,&frame_rgb,1,from_to,3);
+
+            cv::Mat frame_rgb_float;
+            cv::Mat frame_rgb_resized;
+
+            // normalize
+            frame_rgb.convertTo(frame_rgb_float, CV_32FC3, 1.f / 255.f);
+            // resize
+            cv::resize(frame_rgb_float, frame_rgb_resized, input_size, 0, 0, cv::INTER_LINEAR);
+            // get the pointer (cast to data type of Mat)
+            float *pFrame = (float *)frame_rgb_resized.data;
+            // loop through rows, columns and channels
+            for (int channel = 0; channel < channels; ++channel)
+            {
+              for (int row = 0; row < input_height; ++row)
+              {
+                  for (int column = 0; column < input_width; ++column)
+                  {
+                    mData.emplace_back(pFrame[frame_rgb_resized.channels() * (frame_rgb_resized.cols * row + column) + channel]);
+                  }
+              }
+            }
+          }
+        } 
+    }
+
+    int mBatchSize{0};
+    int mBatchCount{0}; // batch that will be read on the next invocation of next()
+    int mMaxBatches{0};
+    Dims mDims{};
+    std::vector<float> mData{};
+    std::vector<float> mLabels{};
+};
+
 // preprocessing stage ------------------------------------------------------------------------------------------------
 int * preprocessImage(std::fstream& file, float* gpu_input, const nvinfer1::Dims& dims)
 {
@@ -140,7 +268,8 @@ int * preprocessImage(std::fstream& file, float* gpu_input, const nvinfer1::Dims
       {
 		    csv_row.push_back(word);
 	    }
-	    std::string image_path = "/media/data/train_images/" + csv_row[0];
+      // path to dataset
+	    std::string image_path = "/media/SD/train_images/" + csv_row[0];
       // store label
 		  labels[b] = std::stoi(csv_row[1]);
 
@@ -155,6 +284,7 @@ int * preprocessImage(std::fstream& file, float* gpu_input, const nvinfer1::Dims
 		    return labels;
 	    }
 
+      // uncomment this to see the input image
 	    // cv::namedWindow("Input Image", cv::WINDOW_AUTOSIZE);
 	    // cv::imshow("Input Image",frame_rgb);
 	    // cv::waitKey();
@@ -180,6 +310,7 @@ int * preprocessImage(std::fstream& file, float* gpu_input, const nvinfer1::Dims
 	    cv::cuda::split(gpu_frame, chw);
     }
 
+    // return read image labels
     return labels;
 }
 
@@ -192,9 +323,11 @@ void postprocessResults(float *gpu_output, const nvinfer1::Dims &dims, int *labe
     cudaMemcpy(cpu_output.data(), gpu_output, cpu_output.size() * sizeof(float), cudaMemcpyDeviceToHost);
     for (size_t b = 0; b < batch_size; ++b)
     {
-    	std::cout << "class: " << cpu_output.at(b) << " label: " << *(labels+b) << "\n"; 
-	    file << cpu_output.at(b) << "\n"; 
+      // uncomment this to print the specific outputs to the terminal
+    	// std::cout << "class: " << cpu_output.at(b) << " label: " << *(labels+b) << "\n"; 
+	    file << cpu_output.at(b) << " label: " << *(labels+b) << "\n"; 
 
+        // compare output to label
         if (((*(labels+b) == 0) && (cpu_output.at(b) < 0.5)) || ((*(labels+b) == 1) && (cpu_output.at(b) >= 0.5))){
             total_correct++;
         }
@@ -206,6 +339,7 @@ void postprocessResults(float *gpu_output, const nvinfer1::Dims &dims, int *labe
 void parseOnnxModel(const std::string& model_path, TRTUniquePtr<nvinfer1::ICudaEngine>& engine,
                     TRTUniquePtr<nvinfer1::IExecutionContext>& context)
 {
+    // build network with explicit batch
     const auto explicitBatch = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
     TRTUniquePtr<nvinfer1::IBuilder> builder{nvinfer1::createInferBuilder(gLogger)};
     TRTUniquePtr<nvinfer1::INetworkDefinition> network{builder->createNetworkV2(explicitBatch)};
@@ -219,13 +353,28 @@ void parseOnnxModel(const std::string& model_path, TRTUniquePtr<nvinfer1::ICudaE
     }
     // allow TensorRT to use up to 1GB of GPU memory for tactic selection.
     config->setMaxWorkspaceSize(1ULL << 30);
-    // use FP16 mode if possible
+    
+    // uncomment these lines to use FP16 mode if possible
     // if (builder->platformHasFastFp16())
     // {
-    // config->setFlag(nvinfer1::BuilderFlag::kFP32);
+    // config->setFlag(nvinfer1::BuilderFlag::kFP16);
     // }
-    // max batch size for this network
+
+    // uncomment this to use INT8 mode 
+    // config->setFlag(BuilderFlag::kINT8);
+
+    // max batch size = 1, explicit batch size means there are no additional dimensions
     builder->setMaxBatchSize(1);
+
+    // uncomment these lines when using INT8 mode 
+    // // create the calibration data stream
+    // CustomBatchStream calibrationStream(1, 500, "../valid_files.csv");
+    // // create the calibrator object
+    // std::unique_ptr<IInt8Calibrator> calibrator;
+    // calibrator.reset(new Int8EntropyCalibrator2<CustomBatchStream>(calibrationStream, 0, "Binary","inputs:0"));
+    // config->setInt8Calibrator(calibrator.get());
+
+
     // generate TensorRT engine optimized for the target platform
     engine.reset(builder->buildEngineWithConfig(*network, *config));
     context.reset(engine->createExecutionContext());
@@ -239,6 +388,7 @@ int main(int argc, char* argv[])
         std::cerr << "usage: " << argv[0] << " model.onnx\n";
         return -1;
     }
+    // get onnx model
     std::string model_path(argv[1]);
 
     // initialize TensorRT engine and parse ONNX model
@@ -269,14 +419,15 @@ int main(int argc, char* argv[])
         return -1;
     }
 
+    // open input and output files
     std::fstream file("../valid_files.csv", std::ios::in);
     std::ofstream output_file;
     output_file.open("output_bin.txt");
 
-    //---------Save intermediate results in speed tests------------//
+    // preparation for speed tests  
     unsigned long long int total_clk, min_clk, max_clk, var_clk, clk_read_avrg;
     unsigned long long int total_inf, min_inf, max_inf, var_inf;
-    //-----------CLOCK INIT------------//
+    // clock init
     clockid_t clk = CLOCK_REALTIME;
     struct timespec clk_struct_begin, clk_struct_end;
 
@@ -288,22 +439,26 @@ int main(int argc, char* argv[])
     printf("Measuring clock read overhead\n");
     reset_cumulative(&total_clk, &min_clk, &max_clk, &var_clk);
     clock_gettime(clk, &clk_struct_begin);
-		for(int i = 0; i<5000; i++)
-	{
-		clock_gettime(clk, &clk_struct_begin);
-		clock_gettime(clk, &clk_struct_end);
 
-		update_cumulative(&total_clk, &min_clk, &max_clk, &var_clk,
-			clk_struct_begin.tv_nsec, clk_struct_end.tv_nsec, 0);
-	}
+    // calculate clock overhead
+		for(int i = 0; i<5000; i++)
+	  {
+      clock_gettime(clk, &clk_struct_begin);
+      clock_gettime(clk, &clk_struct_end);
+
+      update_cumulative(&total_clk, &min_clk, &max_clk, &var_clk,
+        clk_struct_begin.tv_nsec, clk_struct_end.tv_nsec, 0);
+	  }
     printf("Clock Statistics for %d consecutive reads\n", 5000);
     printf("Average, Minimum, Maximum, Variance\n");
     printf("%lld,%lld,%lld,%lld\n", clk_read_avrg = total_clk/5000,
 		min_clk, max_clk, variance (var_clk , total_clk, 5000));
 
+    // variables for validation
     int *labels;
     float total_correct = 0;
 
+    // reset timing variables
     reset_cumulative(&total_inf, &min_inf, &max_inf, &var_inf);
 
     if(file.is_open())
@@ -312,26 +467,28 @@ int main(int argc, char* argv[])
 		  labels = preprocessImage(file, (float *) buffers[0], input_dims[0]);
 		  context->enqueue(1, buffers.data(), 0, nullptr);
 		  postprocessResults((float *) buffers[1], output_dims[0], labels, output_file, total_correct);
-	    for (size_t bs = 0; bs < 100; ++bs)
+      // full validation dataset made of 2518 images
+	    for (size_t bs = 0; bs < 2517; ++bs)
 	    {
-        // preprocess input data
         labels = preprocessImage(file, (float *) buffers[0], input_dims[0]);
-        // inference//read a value from clock to eliminate "first-read-jitter"
+        // inference 
+        //read a value from clock to eliminate "first-read-jitter"
         clock_gettime(clk, &clk_struct_begin);
         clock_gettime(clk, &clk_struct_begin);
         context->enqueue(1, buffers.data(), 0, nullptr);
         clock_gettime(clk, &clk_struct_end);
         update_cumulative(&total_inf, &min_inf, &max_inf, &var_inf,
             clk_struct_begin.tv_nsec, clk_struct_end.tv_nsec, clk_read_avrg);
-        // postprocess results
         postprocessResults((float *) buffers[1], output_dims[0], labels, output_file, total_correct);
 	    }
  	  
     }
+    // print statistics
     printf("Average, Minimum, Maximum, Variance\n");
-    printf("%lld,%lld,%lld,%lld\n", total_inf/100,
-		min_inf, max_inf, variance (var_inf , total_inf, 100));
-    // std::cout << "Accuracy: " << total_correct/2512 << std::endl;
+    printf("%lld,%lld,%lld,%lld\n", total_inf/2517,
+		min_inf, max_inf, variance (var_inf , total_inf, 2517));
+    // accuracy is assuming batch size 1
+    std::cout << "Accuracy: " << total_correct/(2517+1) << std::endl;
     for (void* buf : buffers)
     {
         cudaFree(buf);

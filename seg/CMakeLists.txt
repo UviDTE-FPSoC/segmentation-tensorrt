@@ -11,6 +11,20 @@ find_package(OpenCV REQUIRED)
 find_package(TensorRT REQUIRED)
 
 # TARGETS --------------------------------------------------------------------------------------------------------------
-add_executable(infer_seg infer_seg.cpp)
-target_include_directories(infer_seg PUBLIC ${OpenCV_INCLUDE_DIRS} ${CUDA_INCLUDE_DIRS} ${TensorRT_INCLUDE_DIRS})
+set(SAMPLE_SOURCES
+    infer_seg.cpp
+)
+
+set(SAMPLES_COMMON_SOURCES
+    $<BUILD_INTERFACE:/usr/src/tensorrt/samples/common/logger.cpp>
+)
+
+add_executable(infer_seg
+    ${SAMPLE_SOURCES}
+    ${SAMPLES_COMMON_SOURCES}
+)
+
+target_include_directories(infer_seg PUBLIC ${OpenCV_INCLUDE_DIRS} ${CUDA_INCLUDE_DIRS} ${TensorRT_INCLUDE_DIRS} $<BUILD_INTERFACE:/usr/src/tensorrt/samples/common/>)
 target_link_libraries(infer_seg PUBLIC ${OpenCV_LIBS} ${CUDA_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} ${TensorRT_LIBRARIES})
+
+
