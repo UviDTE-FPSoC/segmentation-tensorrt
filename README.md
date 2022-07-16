@@ -3,7 +3,7 @@ Code to train in cloud and run in Jetson the Severstal defect segmentation model
 
 ## Repository contents
 * `inference`: Source code and for the TensorRT inferece. Uses OpenCV 4.5.0 and TensorRT 7.1.3 with CUDA 10.2.
-    * `binary`: Source code for the binary inference. 
+    * `binary`: Source code for the binary inference. Reduced precision can be modified before compilation in infer_bin.cpp, the required changes are specified in the code.
     
         Compilation (inside folder):
         <pre><code>mkdir build</code></pre>
@@ -11,7 +11,7 @@ Code to train in cloud and run in Jetson the Severstal defect segmentation model
         Inference (inside folder):
         <pre><code>./infer_bin {network name}.onnx</code></pre>
 
-    * `seg`: Source code for the segmentation inference. 
+    * `seg`: Source code for the segmentation inference. Reduced precision can be modified before compilation in infer_seg.cpp, the required changes are specified in the code.
 
         Compilation (inside folder):
         <pre><code>mkdir build</code></pre>
